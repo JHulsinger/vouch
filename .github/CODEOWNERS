@@ -1,0 +1,11 @@
+# Code Owners are automatically requested for reviews when their owned files are changed.
+# Format: <path> <user_or_team>
+
+*       @jhulsinger
+
+# Cargo/Rust infrastructure
+Cargo.toml  @jhulsinger
+Cargo.lock  @jhulsinger
+
+# Core logic
+/src/       @jhulsinger

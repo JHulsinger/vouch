@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/jhulsinger/vouch/security/advisories/new
+    about: Preferred. Use GitHub private security advisories instead of opening a public issue.
+  - name: Security policy
+    url: https://github.com/jhulsinger/vouch/security/policy
+    about: Read the supported versions and reporting process.
