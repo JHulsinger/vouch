@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD as B64_URL_SAFE};
+use base64::Engine as _;
 use instant_acme::{
-    Account, AccountCredentials, Identifier, LetsEncrypt, NewAccount, NewOrder, Order,
+    Account, AccountCredentials, ExternalAccountKey, Identifier, LetsEncrypt, NewAccount, NewOrder,
+    Order,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -15,6 +18,63 @@ const RETRY_SUCCESS_PROB: [f64; 5] = [0.22, 0.38, 0.52, 0.64, 0.82];
 pub struct AcmeClient {
     pub account: Account,
     pub config_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternalAccountBindingConfig {
+    pub kid: String,
+    pub hmac_key: Vec<u8>,
+}
+
+impl ExternalAccountBindingConfig {
+    pub fn new(kid: String, hmac_key: &str) -> Result<Self> {
+        let hmac_key = decode_eab_hmac_key(hmac_key)?;
+        Ok(Self { kid, hmac_key })
+    }
+}
+
+fn decode_eab_hmac_key(input: &str) -> Result<Vec<u8>> {
+    let input = input.trim();
+    if input.is_empty() {
+        anyhow::bail!("EAB HMAC key is empty");
+    }
+
+    let (prefix, value) = input
+        .split_once(':')
+        .map(|(p, v)| (Some(p.trim().to_ascii_lowercase()), v.trim()))
+        .unwrap_or((None, input));
+
+    let decode_hex = |s: &str| -> Result<Vec<u8>> {
+        Ok(hex::decode(s.trim()).context("Failed to decode EAB key as hex")?)
+    };
+    let decode_b64_std = |s: &str| -> Result<Vec<u8>> {
+        Ok(B64_STANDARD
+            .decode(s.trim())
+            .context("Failed to decode EAB key as base64")?)
+    };
+    let decode_b64_url = |s: &str| -> Result<Vec<u8>> {
+        Ok(B64_URL_SAFE
+            .decode(s.trim())
+            .context("Failed to decode EAB key as base64url")?)
+    };
+
+    let key = match prefix.as_deref() {
+        Some("hex") => decode_hex(value)?,
+        Some("base64") | Some("b64") => decode_b64_std(value)?,
+        Some("base64url") | Some("b64url") => decode_b64_url(value)?,
+        Some(other) => anyhow::bail!(
+            "Unknown EAB key encoding prefix '{other}'. Use 'hex:', 'base64:' or 'base64url:'"
+        ),
+        None => decode_b64_url(value)
+            .or_else(|_| decode_b64_std(value))
+            .or_else(|_| decode_hex(value))
+            .context("Failed to decode EAB key (tried base64url, base64, hex)")?,
+    };
+
+    if key.is_empty() {
+        anyhow::bail!("Decoded EAB HMAC key is empty");
+    }
+    Ok(key)
 }
 
 impl AcmeClient {
@@ -58,6 +118,7 @@ impl AcmeClient {
         production: bool,
         custom_server: Option<String>,
         root_cert: Option<PathBuf>,
+        external_account_binding: Option<ExternalAccountBindingConfig>,
     ) -> Result<Self> {
         fs::create_dir_all(&config_dir).context("Failed to create config dir")?;
         let creds_path = config_dir.join("account_creds.json");
@@ -107,6 +168,18 @@ impl AcmeClient {
                     .context("Failed to init HTTP client with custom root")?,
                 None => instant_acme::Account::builder().context("Failed to init HTTP client")?,
             };
+
+            let eak = external_account_binding.as_ref().map(|cfg| {
+                ExternalAccountKey::new(cfg.kid.clone(), cfg.hmac_key.as_slice())
+            });
+            if let Some(cfg) = external_account_binding.as_ref() {
+                info!(
+                    "🔗 Using External Account Binding (kid={}, hmac_key_len={})",
+                    cfg.kid,
+                    cfg.hmac_key.len()
+                );
+            }
+
             let (account, creds) = builder
                 .create(
                     &NewAccount {
@@ -115,7 +188,7 @@ impl AcmeClient {
                         only_return_existing: false,
                     },
                     url,
-                    None,
+                    eak.as_ref(),
                 )
                 .await
                 .context("Failed to create ACME account")?;
@@ -329,5 +402,40 @@ impl AcmeClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_eab_hmac_key_base64url_no_pad() {
+        let key = decode_eab_hmac_key("Zm9vYmFy").unwrap();
+        assert_eq!(key, b"foobar");
+    }
+
+    #[test]
+    fn decode_eab_hmac_key_base64_std() {
+        let key = decode_eab_hmac_key("base64:Zm9vYmFy").unwrap();
+        assert_eq!(key, b"foobar");
+    }
+
+    #[test]
+    fn decode_eab_hmac_key_hex() {
+        let key = decode_eab_hmac_key("hex:666f6f626172").unwrap();
+        assert_eq!(key, b"foobar");
+    }
+
+    #[test]
+    fn decode_eab_hmac_key_rejects_unknown_prefix() {
+        let err = decode_eab_hmac_key("nope:abcd").unwrap_err();
+        assert!(err.to_string().contains("Unknown EAB key encoding prefix"));
+    }
+
+    #[test]
+    fn decode_eab_hmac_key_rejects_empty() {
+        let err = decode_eab_hmac_key("   ").unwrap_err();
+        assert!(err.to_string().contains("empty"));
     }
 }

@@ -4,7 +4,7 @@ use directories::ProjectDirs;
 use std::path::PathBuf;
 use tracing::{error, info};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
-use vouch::acme_client::AcmeClient;
+use vouch::acme_client::{AcmeClient, ExternalAccountBindingConfig};
 use vouch::plugins::webroot::WebrootAuthenticator;
 use x509_parser::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,6 +56,14 @@ struct Cli {
     /// Path to a custom root certificate PEM file (useful for testing against Pebble)
     #[arg(long, global = true)]
     root_cert: Option<PathBuf>,
+
+    /// External Account Binding key identifier (KID) for ACME providers that require EAB
+    #[arg(long, global = true, env = "VOUCH_EAB_KID")]
+    eab_kid: Option<String>,
+
+    /// External Account Binding HMAC key (supports `hex:`, `base64:`, `base64url:` prefixes; otherwise auto-detects)
+    #[arg(long, global = true, env = "VOUCH_EAB_HMAC_KEY")]
+    eab_hmac_key: Option<String>,
 
     /// Log format
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
@@ -168,6 +176,13 @@ async fn main() {
 }
 
 async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
+    let external_account_binding = match (cli.eab_kid.clone(), cli.eab_hmac_key.clone()) {
+        (None, None) => None,
+        (Some(_), None) => anyhow::bail!("--eab-kid provided without --eab-hmac-key"),
+        (None, Some(_)) => anyhow::bail!("--eab-hmac-key provided without --eab-kid"),
+        (Some(kid), Some(key)) => Some(ExternalAccountBindingConfig::new(kid, &key)?),
+    };
+
     match &cli.command {
         Commands::Certonly {
             domain,
@@ -188,7 +203,15 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
             
             let env_name = if cli.server.is_some() { "CUSTOM" } else if cli.production { "PRODUCTION" } else { "STAGING" };
             info!("📦 Registering account with Let's Encrypt ({env_name})...");
-            let client = AcmeClient::new(email, config_dir, cli.production, cli.server, cli.root_cert).await?;
+            let client = AcmeClient::new(
+                email,
+                config_dir,
+                cli.production,
+                cli.server,
+                cli.root_cert,
+                external_account_binding.clone(),
+            )
+            .await?;
             info!("✅ Account created/loaded!");
             
             info!("📝 Creating order for {}...", domain);
@@ -236,7 +259,15 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
                                     info!("📦 Registering account with Let's Encrypt ({env_name})...");
                                     
                                     // Instantiate the client with an empty email (uses existing account)
-                                    let client = AcmeClient::new("", config_dir.clone(), cli.production, cli.server.clone(), cli.root_cert.clone()).await?;
+                                    let client = AcmeClient::new(
+                                        "",
+                                        config_dir.clone(),
+                                        cli.production,
+                                        cli.server.clone(),
+                                        cli.root_cert.clone(),
+                                        external_account_binding.clone(),
+                                    )
+                                    .await?;
                                     info!("📝 Creating order for {}...", domain_name);
                                     let mut order = client.new_order(&domain_name).await?;
 
@@ -297,7 +328,7 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::rcgen::{CertificateParams, KeyPair};
+    use ::rcgen::CertificateParams;
     use ::time::{OffsetDateTime, Duration};
 
     #[test]
