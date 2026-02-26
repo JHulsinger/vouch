@@ -5,7 +5,7 @@ use instant_acme::{
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const RETRY_ATTEMPTS: usize = 4;
 const RETRY_FAILURE_PENALTY_MS: f64 = 12_000.0;
@@ -272,6 +272,16 @@ impl AcmeClient {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let key_path = self.config_dir.join("domain.key");
+        let crt_path = self.config_dir.join("domain.crt");
+        
+        let key_old_path = key_path.with_extension("key.old");
+        let crt_old_path = crt_path.with_extension("crt.old");
+        let has_old = key_path.exists() && crt_path.exists();
+        if has_old {
+            std::fs::copy(&key_path, &key_old_path).ok();
+            std::fs::copy(&crt_path, &crt_old_path).ok();
+        }
+
         let mut temp_key = tempfile::Builder::new()
             .prefix("key_tmp_")
             .tempfile_in(&self.config_dir)
@@ -282,7 +292,6 @@ impl AcmeClient {
         temp_key.write_all(private_key_pem.as_bytes())?;
         temp_key.flush()?;
         temp_key.persist(&key_path)?;
-        let crt_path = self.config_dir.join("domain.crt");
         let mut temp_crt = tempfile::Builder::new()
             .prefix("crt_tmp_")
             .tempfile_in(&self.config_dir)
@@ -300,13 +309,23 @@ impl AcmeClient {
 
         if let Some(ref mut inst) = installer {
             info!("🔌 Delegating deployment to Installer plugin...");
-            inst.deploy_cert(
-                domain,
-                crt_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid cert path"))?,
-                key_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid key path"))?,
-            )?;
-            inst.save("vouch-renewal")?;
-            inst.restart()?;
+            if let Err(e) = (|| -> Result<()> {
+                inst.deploy_cert(
+                    domain,
+                    crt_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid cert path"))?,
+                    key_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid key path"))?,
+                )?;
+                inst.save("vouch-renewal")?;
+                inst.restart()?;
+                Ok(())
+            })() {
+                error!("❌ Installer failed: {}. Rolling back to previous certificate...", e);
+                if has_old {
+                    std::fs::copy(&key_old_path, &key_path).ok();
+                    std::fs::copy(&crt_old_path, &crt_path).ok();
+                }
+                return Err(e);
+            }
         }
 
         Ok(())

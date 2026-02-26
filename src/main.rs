@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use std::path::PathBuf;
 use tracing::{error, info};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use vouch::acme_client::AcmeClient;
 use vouch::plugins::webroot::WebrootAuthenticator;
 use x509_parser::prelude::*;
@@ -125,6 +126,21 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
+    let default_config_dir = ProjectDirs::from("io", "vouch", "vouch")
+        .map(|project_dirs| project_dirs.config_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".").join(".vouch"));
+    
+    let config_dir = cli.config_dir.clone().unwrap_or(default_config_dir.clone());
+    let work_dir = cli.work_dir.clone().unwrap_or_else(|| config_dir.join("work"));
+    let logs_dir = cli.logs_dir.clone().unwrap_or_else(|| config_dir.join("logs"));
+
+    std::fs::create_dir_all(&config_dir).ok();
+    std::fs::create_dir_all(&work_dir).ok();
+    std::fs::create_dir_all(&logs_dir).ok();
+
+    let file_appender = tracing_appender::rolling::daily(&logs_dir, "vouch.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
     let log_filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
         .from_env_lossy();
@@ -133,27 +149,25 @@ async fn main() {
         LogFormat::Text => {
             tracing_subscriber::fmt()
                 .with_env_filter(log_filter)
+                .with_writer(std::io::stdout.and(non_blocking))
                 .init();
         }
         LogFormat::Json => {
             tracing_subscriber::fmt()
                 .json()
                 .with_env_filter(log_filter)
+                .with_writer(std::io::stdout.and(non_blocking))
                 .init();
         }
     }
 
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, config_dir, work_dir).await {
         error!("Error: {:#}", e);
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
-    let default_config_dir = ProjectDirs::from("io", "vouch", "vouch")
-        .map(|project_dirs| project_dirs.config_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(".").join(".vouch"));
-    let config_dir = cli.config_dir.unwrap_or(default_config_dir);
+async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
     match &cli.command {
         Commands::Certonly {
             domain,
@@ -164,6 +178,12 @@ async fn run(cli: Cli) -> Result<()> {
             dns_propagation_seconds,
             preferred_challenge,
         } => {
+            if domain.starts_with("*.") {
+                if _dns_plugin.is_none() || preferred_challenge != "dns-01" {
+                    anyhow::bail!("Wildcard domains (*.example.com) require DNS-01 challenge. Please provide a --dns-plugin.");
+                }
+            }
+            
             info!("🚀 Starting vouch for domain: {}", domain);
             
             let env_name = if cli.server.is_some() { "CUSTOM" } else if cli.production { "PRODUCTION" } else { "STAGING" };

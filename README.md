@@ -144,10 +144,10 @@ Important: “GitHub Private Vulnerability Reporting” is a **GitHub repository
 
 ## Known limitations (beta)
 
-- `--work-dir` and `--logs-dir` are parsed but not fully wired into runtime behavior.
+- None currently impacting core automation. All roadmap features (v1) are implemented.
 
 ## Roadmap (practical next steps)
 
 1. **Plugin Marketplace:** Build the `vouch plugin` command to download IPC plugins securely over HTTP (using the Git index repository model).
-2. **Wildcard Support:** Expose native wildcard CLI validation mapping internally to DNS-01 only.
-3. **Automated Reversion:** Store `.old` copies of certificates before renewal to rollback if an installer fails validation.
+2. **OCSP Must-Staple:** Add support for the Must-Staple extension in certificate requests.
+3. **External PKI:** Support for ACME-EAB (External Account Binding) for integration with enterprise CAs.
