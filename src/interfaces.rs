@@ -3,9 +3,9 @@ use anyhow::Result;
 /// Responsible for satisfying ACME challenges (e.g., placing HTTP-01 files or setting DNS-01 records).
 pub trait Authenticator {
     /// Perform the setup required to satisfy the challenge.
-    fn perform(&mut self, domain: &str) -> Result<()>;
+    fn perform(&mut self, domain: &str, token: &str, key_authorization: &str) -> Result<()>;
     /// Clean up the challenge artifacts after verification.
-    fn cleanup(&mut self, domain: &str) -> Result<()>;
+    fn cleanup(&mut self, domain: &str, token: &str) -> Result<()>;
 }
 /// Matches the Certbot `Installer` interface.
 /// Responsible for deploying certificates and modifying web server configurations.
@@ -91,21 +91,21 @@ impl IpcPlugin {
     }
 }
 impl Authenticator for IpcPlugin {
-    fn perform(&mut self, domain: &str) -> Result<()> {
+    fn perform(&mut self, domain: &str, token: &str, key_authorization: &str) -> Result<()> {
         println!(
             "🔌 Dispatching Authenticator::perform to {}...",
             self.binary_path
         );
         self.rpc_call(
             "authenticator.perform",
-            serde_json::json!({ "domain" : domain }),
+            serde_json::json!({ "domain" : domain, "token": token, "key_authorization": key_authorization }),
         )?;
         Ok(())
     }
-    fn cleanup(&mut self, domain: &str) -> Result<()> {
+    fn cleanup(&mut self, domain: &str, token: &str) -> Result<()> {
         self.rpc_call(
             "authenticator.cleanup",
-            serde_json::json!({ "domain" : domain }),
+            serde_json::json!({ "domain" : domain, "token": token }),
         )?;
         Ok(())
     }
@@ -141,3 +141,35 @@ impl Installer for IpcPlugin {
     }
 }
 impl Plugin for IpcPlugin {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn test_ipc_plugin_rpc_call() {
+        // Create a dummy shell script that acts as an IPC plugin
+        let mut script = NamedTempFile::new().unwrap();
+        let script_content = r#"#!/bin/bash
+read -r payload
+# Echo back a valid JSON-RPC response based on the "method" requested (if we cared to parse it)
+echo '{"jsonrpc": "2.0", "result": {"status": "success"}, "id": 1}'
+"#;
+        script.write_all(script_content.as_bytes()).unwrap();
+        
+        // Make it executable
+        let mut perms = script.as_file().metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        script.as_file().set_permissions(perms).unwrap();
+        
+        let plugin = IpcPlugin::new(script.path().to_str().unwrap());
+        
+        let res = plugin.rpc_call("test.method", serde_json::json!({"foo": "bar"}));
+        assert!(res.is_ok(), "RPC call to dummy script failed: {:?}", res);
+        let val = res.unwrap();
+        assert_eq!(val.get("status").unwrap().as_str().unwrap(), "success");
+    }
+}

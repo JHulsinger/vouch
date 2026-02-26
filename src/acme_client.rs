@@ -5,6 +5,7 @@ use instant_acme::{
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
+use tracing::{info, warn};
 
 const RETRY_ATTEMPTS: usize = 4;
 const RETRY_FAILURE_PENALTY_MS: f64 = 12_000.0;
@@ -51,7 +52,13 @@ impl AcmeClient {
     }
 
     /// Initialize a new ACME client and register an account with the staging API.
-    pub async fn new(email: &str, config_dir: PathBuf) -> Result<Self> {
+    pub async fn new(
+        email: &str,
+        config_dir: PathBuf,
+        production: bool,
+        custom_server: Option<String>,
+        root_cert: Option<PathBuf>,
+    ) -> Result<Self> {
         fs::create_dir_all(&config_dir).context("Failed to create config dir")?;
         let creds_path = config_dir.join("account_creds.json");
         let lock_path = config_dir.join("account_creds.json.lock");
@@ -69,30 +76,45 @@ impl AcmeClient {
             .lock_exclusive()
             .context("Failed to lock account creds")?;
         let account = if creds_path.exists() {
-            println!("🔄 Loading existing ACME account credentials...");
+            info!("🔄 Loading existing ACME account credentials...");
             let creds_json = fs::read_to_string(&creds_path)?;
             let creds: AccountCredentials = serde_json::from_str(&creds_json)?;
-            instant_acme::Account::builder()
-                .context("Failed to init HTTP client")?
+            let builder = match root_cert {
+                Some(path) => instant_acme::Account::builder_with_root(path)
+                    .context("Failed to init HTTP client with custom root")?,
+                None => instant_acme::Account::builder().context("Failed to init HTTP client")?,
+            };
+            builder
                 .from_credentials(creds)
                 .await?
         } else {
-            println!("🆕 Generating new ACME account instance...");
+            info!("🆕 Generating new ACME account instance...");
             let contact = if email.is_empty() {
                 vec![]
             } else {
                 vec![format!("mailto:{}", email)]
             };
             let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
-            let (account, creds) = instant_acme::Account::builder()
-                .context("Failed to init HTTP client")?
+            let url = if let Some(s) = custom_server {
+                s
+            } else if production {
+                LetsEncrypt::Production.url().to_string()
+            } else {
+                LetsEncrypt::Staging.url().to_string()
+            };
+            let builder = match root_cert {
+                Some(path) => instant_acme::Account::builder_with_root(path)
+                    .context("Failed to init HTTP client with custom root")?,
+                None => instant_acme::Account::builder().context("Failed to init HTTP client")?,
+            };
+            let (account, creds) = builder
                 .create(
                     &NewAccount {
                         contact: &contact_refs,
                         terms_of_service_agreed: true,
                         only_return_existing: false,
                     },
-                    LetsEncrypt::Staging.url().to_string(),
+                    url,
                     None,
                 )
                 .await
@@ -127,7 +149,7 @@ impl AcmeClient {
             match operation().await {
                 Ok(val) => return Ok(val),
                 Err(e) => {
-                    println!("⚠️ Network/API error: {}. Retrying in {:?}...", e, delay);
+                    warn!("Network/API error: {}. Retrying in {:?}...", e, delay);
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -150,7 +172,15 @@ impl AcmeClient {
         .await
     }
     /// Wait for the order to be ready, simulating challenge fulfillment, and finalize it.
-    pub async fn verify_and_finalize(&self, order: &mut Order) -> Result<()> {
+    pub async fn verify_and_finalize(
+        &self,
+        order: &mut Order,
+        domain: &str,
+        mut authenticator: Option<&mut dyn crate::interfaces::Authenticator>,
+        mut installer: Option<&mut dyn crate::interfaces::Installer>,
+        preferred_challenge: &str,
+        dns_propagation_seconds: u64,
+    ) -> Result<()> {
         use instant_acme::{AuthorizationStatus, ChallengeType, OrderStatus, RetryPolicy};
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
@@ -160,14 +190,41 @@ impl AcmeClient {
                 AuthorizationStatus::Valid => continue,
                 _ => anyhow::bail!("Invalid authorization status: {:?}", authz.status),
             }
-            println!(
-                "⚠️ Stub: Authenticator would deploy challenge here for {}...",
-                authz.identifier()
-            );
+            let domain_ident = authz.identifier().to_string();
+
+            let challenge_type = if preferred_challenge == "dns-01" {
+                ChallengeType::Dns01
+            } else {
+                ChallengeType::Http01
+            };
+
             let mut challenge = authz
-                .challenge(ChallengeType::Http01)
-                .ok_or_else(|| anyhow::anyhow!("no http01 challenge found"))?;
-            println!("Setting challenge ready with backoff...");
+                .challenge(challenge_type.clone())
+                .ok_or_else(|| anyhow::anyhow!("no {:?} challenge found", challenge_type))?;
+
+            let token = challenge.token.clone();
+            let key_authorization = challenge
+                .key_authorization()
+                .as_str()
+                .to_string();
+
+            if let Some(ref mut auth) = authenticator {
+                info!("🔌 Delegating challenge to Authenticator plugin...");
+                auth.perform(&domain_ident, &token, &key_authorization)?;
+                
+                if challenge_type == ChallengeType::Dns01 {
+                    info!("⏳ Waiting {} seconds for DNS propagation...", dns_propagation_seconds);
+                    tokio::time::sleep(std::time::Duration::from_secs(dns_propagation_seconds)).await;
+                }
+            } else {
+                info!(
+                    "Stub: Authenticator would deploy challenge ({:?}) here for {}...",
+                    challenge_type,
+                    domain_ident
+                );
+            }
+
+            info!("Setting challenge ready with backoff...");
             let mut ready = false;
             for delay in Self::dynamic_retry_plan(RETRY_ATTEMPTS) {
                 match challenge.set_ready().await {
@@ -176,8 +233,8 @@ impl AcmeClient {
                         break;
                     }
                     Err(e) => {
-                        println!(
-                            "⚠️ API error communicating challenge readiness: {}. Retrying in {:?}...",
+                        warn!(
+                            "API error communicating challenge readiness: {}. Retrying in {:?}...",
                             e, delay
                         );
                         tokio::time::sleep(delay).await;
@@ -185,13 +242,20 @@ impl AcmeClient {
                 }
             }
             if !ready {
+                if let Some(ref mut auth) = authenticator {
+                    let _ = auth.cleanup(&domain_ident, &token);
+                }
                 challenge
                     .set_ready()
                     .await
                     .context("Failed to set challenge ready after maximum retries")?;
             }
+
+            if let Some(ref mut auth) = authenticator {
+                let _ = auth.cleanup(&domain_ident, &token);
+            }
         }
-        println!("⏳ Polling Let's Encrypt for order status...");
+        info!("⏳ Polling Let's Encrypt for order status...");
         let status = order
             .poll_ready(&RetryPolicy::default())
             .await
@@ -199,7 +263,7 @@ impl AcmeClient {
         if status != OrderStatus::Ready {
             anyhow::bail!("Unexpected order status: {:?}", status);
         }
-        println!("📜 Finalizing order and generating private key...");
+        info!("📜 Finalizing order and generating private key...");
         let private_key_pem = order.finalize().await.context("Failed to finalize order")?;
         let cert_chain_pem = order
             .poll_certificate(&RetryPolicy::default())
@@ -229,10 +293,22 @@ impl AcmeClient {
         temp_crt.write_all(cert_chain_pem.as_bytes())?;
         temp_crt.flush()?;
         temp_crt.persist(&crt_path)?;
-        println!(
+        info!(
             "✅ Certificates successfully saved to {:?}",
             self.config_dir
         );
+
+        if let Some(ref mut inst) = installer {
+            info!("🔌 Delegating deployment to Installer plugin...");
+            inst.deploy_cert(
+                domain,
+                crt_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid cert path"))?,
+                key_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid key path"))?,
+            )?;
+            inst.save("vouch-renewal")?;
+            inst.restart()?;
+        }
+
         Ok(())
     }
 }
