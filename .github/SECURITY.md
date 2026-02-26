@@ -10,8 +10,6 @@
 
 Please do **NOT** open a public issue for security vulnerabilities.
 
-Preferred: use GitHub Private Vulnerability Reporting (the “Report a vulnerability” button) which creates a private draft security advisory for maintainers.
-
-If that option is unavailable for any reason, email the details to `jhulsinger@gmail.com`.
+Use GitHub Private Vulnerability Reporting (the “Report a vulnerability” button) which creates a private draft security advisory for maintainers.
 
 We take all security vulnerabilities seriously and will work to address them privately before disclosing them publicly.
