@@ -28,7 +28,7 @@ impl Authenticator for WebrootAuthenticator {
         Ok(())
     }
 
-    fn cleanup(&mut self, _domain: &str, token: &str) -> Result<()> {
+    fn cleanup(&mut self, _domain: &str, token: &str, _key_authorization: &str) -> Result<()> {
         let mut path = self.webroot_path.clone();
         path.push(".well-known");
         path.push("acme-challenge");
@@ -70,12 +70,12 @@ mod tests {
         assert_eq!(content, key_auth, "Challenge file content mismatch");
 
         // 2. Test Cleanup
-        auth.cleanup(domain, token)?;
+        auth.cleanup(domain, token, key_auth)?;
         
         assert!(!expected_path.exists(), "Challenge file was not deleted during cleanup");
 
         // 3. Test Idempotent Cleanup (should not error if already deleted)
-        assert!(auth.cleanup(domain, token).is_ok(), "Cleanup should tolerate missing files");
+        assert!(auth.cleanup(domain, token, key_auth).is_ok(), "Cleanup should tolerate missing files");
 
         Ok(())
     }

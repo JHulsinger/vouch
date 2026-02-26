@@ -59,7 +59,7 @@ impl Authenticator for ManualAuthenticator {
         Ok(())
     }
 
-    fn cleanup(&mut self, domain: &str, token: &str) -> Result<()> {
+    fn cleanup(&mut self, domain: &str, token: &str, key_authorization: &str) -> Result<()> {
         match self.challenge {
             ManualChallenge::Http01 => {
                 eprintln!(
@@ -69,8 +69,8 @@ impl Authenticator for ManualAuthenticator {
             }
             ManualChallenge::Dns01 => {
                 eprintln!(
-                    "Manual cleanup: remove the TXT record _acme-challenge.{}",
-                    domain
+                    "Manual cleanup: remove the TXT record _acme-challenge.{} value {}",
+                    domain, key_authorization
                 );
             }
         }

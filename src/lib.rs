@@ -4,3 +4,4 @@ pub mod interfaces;
 pub mod keygen;
 pub mod plugins;
 pub mod renewal;
+pub mod storage;

@@ -5,7 +5,7 @@ pub trait Authenticator {
     /// Perform the setup required to satisfy the challenge.
     fn perform(&mut self, domain: &str, token: &str, key_authorization: &str) -> Result<()>;
     /// Clean up the challenge artifacts after verification.
-    fn cleanup(&mut self, domain: &str, token: &str) -> Result<()>;
+    fn cleanup(&mut self, domain: &str, token: &str, key_authorization: &str) -> Result<()>;
 }
 /// Matches the Certbot `Installer` interface.
 /// Responsible for deploying certificates and modifying web server configurations.
@@ -102,10 +102,10 @@ impl Authenticator for IpcPlugin {
         )?;
         Ok(())
     }
-    fn cleanup(&mut self, domain: &str, token: &str) -> Result<()> {
+    fn cleanup(&mut self, domain: &str, token: &str, key_authorization: &str) -> Result<()> {
         self.rpc_call(
             "authenticator.cleanup",
-            serde_json::json!({ "domain" : domain, "token": token }),
+            serde_json::json!({ "domain" : domain, "token": token, "key_authorization": key_authorization }),
         )?;
         Ok(())
     }

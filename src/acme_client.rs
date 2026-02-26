@@ -14,6 +14,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::keygen::generate_csr_der_and_private_key_pem;
+use crate::storage::{write_lineage, LineagePaths, read_live_symlinks, restore_live_symlinks};
 
 #[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub enum KeyType {
@@ -150,8 +151,19 @@ impl AcmeClient {
         external_account_binding: Option<ExternalAccountBindingConfig>,
     ) -> Result<Self> {
         fs::create_dir_all(&config_dir).context("Failed to create config dir")?;
-        let creds_path = config_dir.join("account_creds.json");
-        let lock_path = config_dir.join("account_creds.json.lock");
+        let accounts_dir = config_dir.join("accounts").join("vouch");
+        fs::create_dir_all(&accounts_dir).context("Failed to create accounts dir")?;
+
+        let legacy_creds = config_dir.join("account_creds.json");
+        let legacy_lock = config_dir.join("account_creds.json.lock");
+        let new_creds = accounts_dir.join("account_creds.json");
+        let new_lock = accounts_dir.join("account_creds.json.lock");
+
+        let (creds_path, lock_path) = if legacy_creds.exists() && !new_creds.exists() {
+            (legacy_creds, legacy_lock)
+        } else {
+            (new_creds, new_lock)
+        };
         use fs3::FileExt;
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
@@ -258,9 +270,12 @@ impl AcmeClient {
             .await
             .context("Action failed after maximum retries")
     }
-    /// Create a new order for a specific domain with exponential backoff.
-    pub async fn new_order(&self, domain: &str) -> Result<Order> {
-        let identifiers = [Identifier::Dns(domain.to_string())];
+    /// Create a new order for one or more domains with exponential backoff.
+    pub async fn new_order_for_domains(&self, domains: &[String]) -> Result<Order> {
+        let identifiers: Vec<Identifier> = domains
+            .iter()
+            .map(|d| Identifier::Dns(d.to_string()))
+            .collect();
         Self::with_backoff(|| async {
             let order = self
                 .account
@@ -271,11 +286,15 @@ impl AcmeClient {
         })
         .await
     }
+    /// Create a new order for a specific domain with exponential backoff.
+    pub async fn new_order(&self, domain: &str) -> Result<Order> {
+        self.new_order_for_domains(&[domain.to_string()]).await
+    }
     /// Wait for the order to be ready, simulating challenge fulfillment, and finalize it.
     pub async fn verify_and_finalize(
         &self,
         order: &mut Order,
-        domain: &str,
+        lineage_name: &str,
         mut authenticator: Option<&mut dyn crate::interfaces::Authenticator>,
         mut installer: Option<&mut dyn crate::interfaces::Installer>,
         preferred_challenge: &str,
@@ -283,7 +302,7 @@ impl AcmeClient {
         key_type: KeyType,
         rsa_key_size: RsaKeySize,
         elliptic_curve: EllipticCurve,
-    ) -> Result<()> {
+    ) -> Result<LineagePaths> {
         use instant_acme::{AuthorizationStatus, ChallengeType, OrderStatus, RetryPolicy};
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
@@ -306,10 +325,12 @@ impl AcmeClient {
                 .ok_or_else(|| anyhow::anyhow!("no {:?} challenge found", challenge_type))?;
 
             let token = challenge.token.clone();
-            let key_authorization = challenge
-                .key_authorization()
-                .as_str()
-                .to_string();
+            let key_auth = challenge.key_authorization();
+            let key_authorization = if challenge_type == ChallengeType::Dns01 {
+                key_auth.dns_value()
+            } else {
+                key_auth.as_str().to_string()
+            };
 
             if let Some(ref mut auth) = authenticator {
                 info!("🔌 Delegating challenge to Authenticator plugin...");
@@ -346,7 +367,7 @@ impl AcmeClient {
             }
             if !ready {
                 if let Some(ref mut auth) = authenticator {
-                    let _ = auth.cleanup(&domain_ident, &token);
+                    let _ = auth.cleanup(&domain_ident, &token, &key_authorization);
                 }
                 challenge
                     .set_ready()
@@ -355,7 +376,7 @@ impl AcmeClient {
             }
 
             if let Some(ref mut auth) = authenticator {
-                let _ = auth.cleanup(&domain_ident, &token);
+                let _ = auth.cleanup(&domain_ident, &token, &key_authorization);
             }
         }
         info!("⏳ Polling Let's Encrypt for order status...");
@@ -373,6 +394,10 @@ impl AcmeClient {
         while let Some(result) = idents.next().await {
             names.push(result.map_err(|e| anyhow::anyhow!("Failed to get identifier: {:?}", e))?.to_string());
         }
+        let primary_name = names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| lineage_name.to_string());
 
         let (csr_der, private_key_pem) = generate_csr_der_and_private_key_pem(
             names,
@@ -388,69 +413,36 @@ impl AcmeClient {
             .await
             .context("Failed to poll certificate")?;
 
-        let domain_dir = self.config_dir.join(domain);
-        fs::create_dir_all(&domain_dir).context("Failed to create domain config dir")?;
-
-        let key_path = domain_dir.join("domain.key");
-        let crt_path = domain_dir.join("domain.crt");
-        let key_old_path = domain_dir.join("domain.key.old");
-        let crt_old_path = domain_dir.join("domain.crt.old");
-        
-        let has_old = key_path.exists() && crt_path.exists();
-        if has_old {
-            std::fs::copy(&key_path, &key_old_path).ok();
-            std::fs::copy(&crt_path, &crt_old_path).ok();
-        }
-
-        let mut temp_key = tempfile::Builder::new()
-            .prefix("key_tmp_")
-            .tempfile_in(&domain_dir)
-            .context("Failed to create temp key file")?;
-        let mut perms = fs::metadata(temp_key.path())?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(temp_key.path(), perms)?;
-        temp_key.write_all(private_key_pem.as_bytes())?;
-        temp_key.flush()?;
-        temp_key.persist(&key_path)?;
-
-        let mut temp_crt = tempfile::Builder::new()
-            .prefix("crt_tmp_")
-            .tempfile_in(&domain_dir)
-            .context("Failed to create temp crt file")?;
-        let mut perms = fs::metadata(temp_crt.path())?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(temp_crt.path(), perms)?;
-        temp_crt.write_all(cert_chain_pem.as_bytes())?;
-        temp_crt.flush()?;
-        temp_crt.persist(&crt_path)?;
-
-        info!(
-            "✅ Certificates successfully saved to {:?}",
-            domain_dir
-        );
+        let lineage = crate::storage::lineage_paths(&self.config_dir, lineage_name);
+        let prior_links = read_live_symlinks(&lineage);
+        let lineage = write_lineage(&self.config_dir, lineage_name, &cert_chain_pem, &private_key_pem)?;
+        info!("Certificates successfully saved to {}", lineage.live_dir.display());
 
         if let Some(ref mut inst) = installer {
             info!("🔌 Delegating deployment to Installer plugin...");
             if let Err(e) = (|| -> Result<()> {
                 inst.deploy_cert(
-                    domain,
-                    crt_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid cert path"))?,
-                    key_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid key path"))?,
+                    &primary_name,
+                    lineage
+                        .fullchain
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid cert path"))?,
+                    lineage
+                        .privkey
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid key path"))?,
                 )?;
                 inst.save("vouch-renewal")?;
                 inst.restart()?;
                 Ok(())
             })() {
                 error!("❌ Installer failed: {}. Rolling back to previous certificate...", e);
-                if has_old {
-                    std::fs::copy(&key_old_path, &key_path).ok();
-                    std::fs::copy(&crt_old_path, &crt_path).ok();
-                }
+                let _ = restore_live_symlinks(&lineage, &prior_links);
                 return Err(e);
             }
         }
 
-        Ok(())
+        Ok(lineage)
     }
 }
 
