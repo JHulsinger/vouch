@@ -162,3 +162,7 @@ Important: “GitHub Private Vulnerability Reporting” is a **GitHub repository
 
 1. **Plugin Marketplace:** Build the `vouch plugin` command to download IPC plugins securely over HTTP (using the Git index repository model).
 2. **Short-Lived Cert Stability:** Optimize the renewal loop for certificates with 7-day validity (the post-OCSP standard), ensuring zero-downtime hot-reloads.
+
+## License
+
+Apache-2.0. See `LICENSE`.
