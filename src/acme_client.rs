@@ -1,11 +1,42 @@
 use anyhow::{Context, Result};
+use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use instant_acme::{
     Account, AccountCredentials, Identifier, LetsEncrypt, NewAccount, NewOrder, Order,
+    ExternalAccountKey,
 };
+use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine};
+use clap::ValueEnum;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{error, info, warn};
+
+#[derive(Clone, Debug, Default, ValueEnum)]
+pub enum KeyType {
+    #[default]
+    Ecdsa,
+    Rsa,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum RsaKeySize {
+    #[default]
+    #[value(name = "2048")]
+    R2048 = 2048,
+    #[value(name = "3072")]
+    R3072 = 3072,
+    #[value(name = "4096")]
+    R4096 = 4096,
+}
+
+#[derive(Clone, Debug, Default, ValueEnum)]
+pub enum EllipticCurve {
+    #[default]
+    P256,
+    P384,
+}
 
 const RETRY_ATTEMPTS: usize = 4;
 const RETRY_FAILURE_PENALTY_MS: f64 = 12_000.0;
@@ -58,6 +89,8 @@ impl AcmeClient {
         production: bool,
         custom_server: Option<String>,
         root_cert: Option<PathBuf>,
+        eab_kid: Option<String>,
+        eab_hmac_key: Option<String>,
     ) -> Result<Self> {
         fs::create_dir_all(&config_dir).context("Failed to create config dir")?;
         let creds_path = config_dir.join("account_creds.json");
@@ -107,6 +140,15 @@ impl AcmeClient {
                     .context("Failed to init HTTP client with custom root")?,
                 None => instant_acme::Account::builder().context("Failed to init HTTP client")?,
             };
+            let eab = match (eab_kid, eab_hmac_key) {
+                (Some(kid), Some(hmac)) => {
+                    let key_bytes = BASE64_URL_SAFE_NO_PAD.decode(hmac.trim_end_matches('='))
+                        .context("Failed to decode EAB HMAC key (expected base64url)")?;
+                    Some(ExternalAccountKey::new(kid, &key_bytes))
+                }
+                _ => None,
+            };
+
             let (account, creds) = builder
                 .create(
                     &NewAccount {
@@ -115,7 +157,7 @@ impl AcmeClient {
                         only_return_existing: false,
                     },
                     url,
-                    None,
+                    eab.as_ref(),
                 )
                 .await
                 .context("Failed to create ACME account")?;
@@ -176,10 +218,12 @@ impl AcmeClient {
         &self,
         order: &mut Order,
         domain: &str,
-        mut authenticator: Option<&mut dyn crate::interfaces::Authenticator>,
         mut installer: Option<&mut dyn crate::interfaces::Installer>,
         preferred_challenge: &str,
         dns_propagation_seconds: u64,
+        key_type: KeyType,
+        rsa_key_size: RsaKeySize,
+        elliptic_curve: EllipticCurve,
     ) -> Result<()> {
         use instant_acme::{AuthorizationStatus, ChallengeType, OrderStatus, RetryPolicy};
         let mut authorizations = order.authorizations();
@@ -263,19 +307,47 @@ impl AcmeClient {
         if status != OrderStatus::Ready {
             anyhow::bail!("Unexpected order status: {:?}", status);
         }
-        info!("📜 Finalizing order and generating private key...");
-        let private_key_pem = order.finalize().await.context("Failed to finalize order")?;
+        info!("📜 Requesting certificate issuance (finalizing)...");
+        
+        let mut names = Vec::new();
+        let mut identifiers = order.identifiers();
+        while let Some(result) = identifiers.next().await {
+            names.push(result.map_err(|e| anyhow::anyhow!("Failed to get identifier: {:?}", e))?.to_string());
+        }
+
+        let mut params = CertificateParams::new(names).context("Failed to create certificate params")?;
+        params.distinguished_name = DistinguishedName::new();
+        
+        let key_pair = match key_type {
+            KeyType::Ecdsa => {
+                let curve = match elliptic_curve {
+                    EllipticCurve::P256 => &rcgen::PKCS_ECDSA_P256_SHA256,
+                    EllipticCurve::P384 => &rcgen::PKCS_ECDSA_P384_SHA384,
+                };
+                KeyPair::generate_for_alg(curve).context("Failed to generate ECDSA key")?
+            }
+            KeyType::Rsa => {
+                KeyPair::generate_rsa(rsa_key_size as usize).context("Failed to generate RSA key")?
+            }
+        };
+
+        let csr = params.serialize_request(&key_pair).context("Failed to serialize CSR")?;
+        order.finalize_csr(csr.der()).await.context("Failed to finalize order with custom CSR")?;
+
+        let private_key_pem = key_pair.serialize_pem();
         let cert_chain_pem = order
-            .poll_certificate(&RetryPolicy::default())
+            .poll_certificate(&RetryPolicy::new())
             .await
             .context("Failed to poll certificate")?;
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let key_path = self.config_dir.join("domain.key");
-        let crt_path = self.config_dir.join("domain.crt");
+
+        let domain_dir = self.config_dir.join(domain);
+        fs::create_dir_all(&domain_dir).context("Failed to create domain config dir")?;
+
+        let key_path = domain_dir.join("domain.key");
+        let crt_path = domain_dir.join("domain.crt");
+        let key_old_path = domain_dir.join("domain.key.old");
+        let crt_old_path = domain_dir.join("domain.crt.old");
         
-        let key_old_path = key_path.with_extension("key.old");
-        let crt_old_path = crt_path.with_extension("crt.old");
         let has_old = key_path.exists() && crt_path.exists();
         if has_old {
             std::fs::copy(&key_path, &key_old_path).ok();
@@ -284,7 +356,7 @@ impl AcmeClient {
 
         let mut temp_key = tempfile::Builder::new()
             .prefix("key_tmp_")
-            .tempfile_in(&self.config_dir)
+            .tempfile_in(&domain_dir)
             .context("Failed to create temp key file")?;
         let mut perms = fs::metadata(temp_key.path())?.permissions();
         perms.set_mode(0o600);
@@ -294,7 +366,7 @@ impl AcmeClient {
         temp_key.persist(&key_path)?;
         let mut temp_crt = tempfile::Builder::new()
             .prefix("crt_tmp_")
-            .tempfile_in(&self.config_dir)
+            .tempfile_in(&domain_dir)
             .context("Failed to create temp crt file")?;
         let mut perms = fs::metadata(temp_crt.path())?.permissions();
         perms.set_mode(0o600);

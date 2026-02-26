@@ -4,10 +4,7 @@ use directories::ProjectDirs;
 use std::path::PathBuf;
 use tracing::{error, info};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
-use vouch::acme_client::AcmeClient;
-use vouch::plugins::webroot::WebrootAuthenticator;
-use x509_parser::prelude::*;
-use std::time::{SystemTime, UNIX_EPOCH};
+use vouch::acme_client::{AcmeClient, KeyType, RsaKeySize, EllipticCurve};
 
 /// Helper to check if a certificate is expiring within a given number of days
 fn check_expiration_days(cert_bytes: &[u8], threshold_days: u32) -> anyhow::Result<(bool, i64)> {
@@ -19,6 +16,23 @@ fn check_expiration_days(cert_bytes: &[u8], threshold_days: u32) -> anyhow::Resu
     let days_left = (not_after - now) / 86400;
 
     Ok((days_left <= threshold_days as i64, days_left))
+}
+
+fn run_hook(command: &str, hook_type: &str) {
+    info!("🏃 Running {} hook: {}", hook_type, command);
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status() {
+        Ok(status) => {
+            if status.success() {
+                info!("✅ {} hook completed successfully", hook_type);
+            } else {
+                error!("❌ {} hook failed with status: {}", hook_type, status);
+            }
+        }
+        Err(e) => error!("❌ Failed to execute {} hook: {}", hook_type, e),
+    }
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -92,6 +106,33 @@ enum Commands {
         /// Preferred challenge type (http-01 or dns-01)
         #[arg(long, default_value = "http-01")]
         preferred_challenge: String,
+
+        /// External Account Binding Key ID
+        #[arg(long)]
+        eab_kid: Option<String>,
+        /// External Account Binding HMAC Key (base64url encoded)
+        #[arg(long)]
+        eab_hmac_key: Option<String>,
+
+        /// Command to run before attempting to obtain a certificate
+        #[arg(long)]
+        pre_hook: Option<String>,
+        /// Command to run after attempting to obtain a certificate (regardless of success)
+        #[arg(long)]
+        post_hook: Option<String>,
+        /// Command to run after successfully obtaining a certificate
+        #[arg(long)]
+        deploy_hook: Option<String>,
+
+        /// Key type (rsa or ecdsa)
+        #[arg(long, value_enum, default_value_t = KeyType::Ecdsa)]
+        key_type: KeyType,
+        /// RSA key size (2048, 3072, 4096)
+        #[arg(long, value_enum, default_value_t = RsaKeySize::R2048)]
+        rsa_key_size: RsaKeySize,
+        /// Elliptic curve (p256, p384)
+        #[arg(long, value_enum, default_value_t = EllipticCurve::P256)]
+        elliptic_curve: EllipticCurve,
     },
     
     /// Renew all certificates that are approaching expiration
@@ -119,6 +160,26 @@ enum Commands {
         /// Webroot path for HTTP-01 challenges (creates .well-known/acme-challenge/)
         #[arg(long)]
         webroot: Option<PathBuf>,
+
+        /// Command to run before attempting renewal
+        #[arg(long)]
+        pre_hook: Option<String>,
+        /// Command to run after attempting renewal (regardless of success)
+        #[arg(long)]
+        post_hook: Option<String>,
+        /// Command to run after successfully renewing a certificate
+        #[arg(long)]
+        deploy_hook: Option<String>,
+
+        /// Key type (rsa or ecdsa)
+        #[arg(long, value_enum, default_value_t = KeyType::Ecdsa)]
+        key_type: KeyType,
+        /// RSA key size (2048, 3072, 4096)
+        #[arg(long, value_enum, default_value_t = RsaKeySize::R2048)]
+        rsa_key_size: RsaKeySize,
+        /// Elliptic curve (p256, p384)
+        #[arg(long, value_enum, default_value_t = EllipticCurve::P256)]
+        elliptic_curve: EllipticCurve,
     },
 }
 
@@ -177,31 +238,76 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
             dns_plugin: _dns_plugin,
             dns_propagation_seconds,
             preferred_challenge,
+            eab_kid,
+            eab_hmac_key,
+            pre_hook,
+            post_hook,
+            deploy_hook,
+            key_type,
+            rsa_key_size,
+            elliptic_curve,
         } => {
-            if domain.starts_with("*.") {
-                if _dns_plugin.is_none() || preferred_challenge != "dns-01" {
-                    anyhow::bail!("Wildcard domains (*.example.com) require DNS-01 challenge. Please provide a --dns-plugin.");
-                }
+            if let Some(hook) = pre_hook {
+                run_hook(hook, "pre");
             }
-            
-            info!("🚀 Starting vouch for domain: {}", domain);
-            
-            let env_name = if cli.server.is_some() { "CUSTOM" } else if cli.production { "PRODUCTION" } else { "STAGING" };
-            info!("📦 Registering account with Let's Encrypt ({env_name})...");
-            let client = AcmeClient::new(email, config_dir, cli.production, cli.server, cli.root_cert).await?;
-            info!("✅ Account created/loaded!");
-            
-            info!("📝 Creating order for {}...", domain);
-            let mut order = client.new_order(domain).await?;
-            info!("✅ Order pending. State: {:?}", order.state().status);
-            
-            let mut webroot_auth = webroot.as_ref().map(|path| WebrootAuthenticator::new(path.clone()));
-            let authenticator_ref = webroot_auth.as_mut().map(|w| w as &mut dyn vouch::interfaces::Authenticator);
 
-            if let Err(e) = client.verify_and_finalize(&mut order, domain, authenticator_ref, None, preferred_challenge, *dns_propagation_seconds).await {
-                error!("❌ Finalization failed: {:?}", e);
+            let result = async {
+                if domain.starts_with("*.") {
+                    if _dns_plugin.is_none() || preferred_challenge != "dns-01" {
+                        anyhow::bail!("Wildcard domains (*.example.com) require DNS-01 challenge. Please provide a --dns-plugin.");
+                    }
+                }
+                
+                info!("🚀 Starting vouch for domain: {}", domain);
+                
+                let env_name = if cli.server.is_some() { "CUSTOM" } else if cli.production { "PRODUCTION" } else { "STAGING" };
+                info!("📦 Registering account with Let's Encrypt ({env_name})...");
+                let client = AcmeClient::new(
+                    email, 
+                    config_dir, 
+                    cli.production, 
+                    cli.server, 
+                    cli.root_cert,
+                    eab_kid.clone(),
+                    eab_hmac_key.clone()
+                ).await?;
+                info!("✅ Account created/loaded!");
+                
+                info!("📝 Creating order for {}...", domain);
+                let mut order = client.new_order(domain).await?;
+                info!("✅ Order pending. State: {:?}", order.state().status);
+                
+                let mut webroot_auth = webroot.as_ref().map(|path| WebrootAuthenticator::new(path.clone()));
+                let authenticator_ref = webroot_auth.as_mut().map(|w| w as &mut dyn vouch::interfaces::Authenticator);
+
+                client.verify_and_finalize(
+                    &mut order, 
+                    domain, 
+                    authenticator_ref, 
+                    None, 
+                    preferred_challenge, 
+                    *dns_propagation_seconds,
+                    key_type.clone(),
+                    *rsa_key_size,
+                    elliptic_curve.clone()
+                ).await?;
+                
+                if let Some(hook) = deploy_hook {
+                    run_hook(hook, "deploy");
+                }
+                
+                Ok(())
+            }.await;
+
+            if let Some(hook) = post_hook {
+                run_hook(hook, "post");
+            }
+
+            if let Err(e) = result {
+                error!("❌ Certonly failed: {:?}", e);
                 std::process::exit(2);
             }
+            
             info!("🏁 vouch run complete");
         },
         Commands::Renew {
@@ -211,7 +317,17 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
             dns_propagation_seconds,
             installer,
             webroot,
+            pre_hook,
+            post_hook,
+            deploy_hook,
+            key_type,
+            rsa_key_size,
+            elliptic_curve,
         } => {
+            if let Some(hook) = pre_hook {
+                run_hook(hook, "pre");
+            }
+
             info!("🔄 Starting renewal check...");
             let mut renewed_count = 0;
             let mut checked_count = 0;
@@ -236,7 +352,7 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
                                     info!("📦 Registering account with Let's Encrypt ({env_name})...");
                                     
                                     // Instantiate the client with an empty email (uses existing account)
-                                    let client = AcmeClient::new("", config_dir.clone(), cli.production, cli.server.clone(), cli.root_cert.clone()).await?;
+                                    let client = AcmeClient::new("", config_dir.clone(), cli.production, cli.server.clone(), cli.root_cert.clone(), None, None).await?;
                                     info!("📝 Creating order for {}...", domain_name);
                                     let mut order = client.new_order(&domain_name).await?;
 
@@ -267,11 +383,24 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
 
                                     let inst_ref: Option<&mut dyn vouch::interfaces::Installer> = ipc_inst.as_mut().map(|i| i as &mut dyn vouch::interfaces::Installer);
                                     
-                                    if let Err(e) = client.verify_and_finalize(&mut order, &domain_name, auth_ref, inst_ref, preferred_challenge_str, *dns_propagation_seconds).await {
+                                    if let Err(e) = client.verify_and_finalize(
+                                        &mut order, 
+                                        &domain_name, 
+                                        auth_ref, 
+                                        inst_ref, 
+                                        preferred_challenge_str, 
+                                        *dns_propagation_seconds,
+                                        key_type.clone(),
+                                        *rsa_key_size,
+                                        elliptic_curve.clone()
+                                    ).await {
                                         error!("❌ Failed to renew certificate for {}: {:?}", domain_name, e);
                                     } else {
                                         info!("✅ Successfully renewed certificate for {}", domain_name);
                                         renewed_count += 1;
+                                        if let Some(hook) = deploy_hook {
+                                            run_hook(hook, "deploy");
+                                        }
                                     }
                                     } else {
                                         info!("⏭️ Certificate for {} is valid for {} more days. Skipping.", domain_name, days_left);
@@ -286,8 +415,12 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
                 }
             }
             
+            if let Some(hook) = post_hook {
+                run_hook(hook, "post");
+            }
+            
             info!("🏁 Renewal check complete. Checked: {}, Renewed: {}", checked_count, renewed_count);
-            let exit_code = if checked_count > 0 && renewed_count == 0 { 0 } else { 0 }; 
+            let exit_code = 0; 
             std::process::exit(exit_code);
         }
     }
