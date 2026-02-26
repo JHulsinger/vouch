@@ -2,7 +2,7 @@
 
 `vouch` is a **beta** effort to modernize Certbot’s core workflow by rebuilding it in Rust, with the long-term goal of being a practical **drop-in replacement** for Certbot (same mental model: a small ACME core + pluggable “how do I solve challenges?” and “how do I install certs?” integrations).
 
-This exists because, in real deployments, Certbot’s biggest pain points are rarely “ACME is hard” — they’re operational:
+This exists because, in real deployments, Certbot’s biggest pain points are rarely “ACME is hard” - they’re operational:
 
 - A Python runtime + packaging story that varies across distros/environments.
 - Dependency churn and environment drift (system Python vs venv vs container vs snap).
@@ -38,10 +38,10 @@ By default, `vouch` writes under an OS-specific config directory (via `directori
 
 Current filenames (in `--config-dir`):
 
-- `account_creds.json` — ACME account credentials
-- `account_creds.json.lock` — lock file used to guard concurrent runs
-- `domain.key` — private key for the finalized order (permissions `0600`)
-- `domain.crt` — certificate chain PEM (permissions `0600`)
+- `account_creds.json` - ACME account credentials
+- `account_creds.json.lock` - lock file used to guard concurrent runs
+- `domain.key` - private key for the finalized order (permissions `0600`)
+- `domain.crt` - certificate chain PEM (permissions `0600`)
 
 Notes:
 
@@ -116,10 +116,10 @@ Important: “GitHub Private Vulnerability Reporting” is a **GitHub repository
 
 ## Project layout
 
-- `src/main.rs` — CLI and orchestration
-- `src/acme_client.rs` — ACME account/order/verify/finalize logic
-- `src/interfaces.rs` — plugin traits + IPC plugin wrapper
-- `src/lib.rs` — public module exports
+- `src/main.rs` - CLI and orchestration
+- `src/acme_client.rs` - ACME account/order/verify/finalize logic
+- `src/interfaces.rs` - plugin traits + IPC plugin wrapper
+- `src/lib.rs` - public module exports
 
 ## Known limitations (beta)
 
