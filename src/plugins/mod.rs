@@ -1,2 +1,2 @@
+pub mod manual;
 pub mod webroot;
-pub mod nginx_ipc;

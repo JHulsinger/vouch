@@ -1,26 +1,28 @@
 use anyhow::{Context, Result};
-use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD as B64_URL_SAFE};
+use base64::Engine as _;
 use instant_acme::{
-    Account, AccountCredentials, Identifier, LetsEncrypt, NewAccount, NewOrder, Order,
-    ExternalAccountKey,
+    Account, AccountCredentials, ExternalAccountKey, Identifier, LetsEncrypt, NewAccount, NewOrder,
+    Order,
 };
-use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine};
 use clap::ValueEnum;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-#[derive(Clone, Debug, Default, ValueEnum)]
+use crate::keygen::generate_csr_der_and_private_key_pem;
+
+#[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub enum KeyType {
     #[default]
     Ecdsa,
     Rsa,
 }
 
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub enum RsaKeySize {
     #[default]
     #[value(name = "2048")]
@@ -31,7 +33,7 @@ pub enum RsaKeySize {
     R4096 = 4096,
 }
 
-#[derive(Clone, Debug, Default, ValueEnum)]
+#[derive(Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub enum EllipticCurve {
     #[default]
     P256,
@@ -46,6 +48,63 @@ const RETRY_SUCCESS_PROB: [f64; 5] = [0.22, 0.38, 0.52, 0.64, 0.82];
 pub struct AcmeClient {
     pub account: Account,
     pub config_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternalAccountBindingConfig {
+    pub kid: String,
+    pub hmac_key: Vec<u8>,
+}
+
+impl ExternalAccountBindingConfig {
+    pub fn new(kid: String, hmac_key: &str) -> Result<Self> {
+        let hmac_key = decode_eab_hmac_key(hmac_key)?;
+        Ok(Self { kid, hmac_key })
+    }
+}
+
+fn decode_eab_hmac_key(input: &str) -> Result<Vec<u8>> {
+    let input = input.trim();
+    if input.is_empty() {
+        anyhow::bail!("EAB HMAC key is empty");
+    }
+
+    let (prefix, value) = input
+        .split_once(':')
+        .map(|(p, v)| (Some(p.trim().to_ascii_lowercase()), v.trim()))
+        .unwrap_or((None, input));
+
+    let decode_hex = |s: &str| -> Result<Vec<u8>> {
+        Ok(hex::decode(s.trim()).context("Failed to decode EAB key as hex")?)
+    };
+    let decode_b64_std = |s: &str| -> Result<Vec<u8>> {
+        Ok(B64_STANDARD
+            .decode(s.trim())
+            .context("Failed to decode EAB key as base64")?)
+    };
+    let decode_b64_url = |s: &str| -> Result<Vec<u8>> {
+        Ok(B64_URL_SAFE
+            .decode(s.trim())
+            .context("Failed to decode EAB key as base64url")?)
+    };
+
+    let key = match prefix.as_deref() {
+        Some("hex") => decode_hex(value)?,
+        Some("base64") | Some("b64") => decode_b64_std(value)?,
+        Some("base64url") | Some("b64url") => decode_b64_url(value)?,
+        Some(other) => anyhow::bail!(
+            "Unknown EAB key encoding prefix '{other}'. Use 'hex:', 'base64:' or 'base64url:'"
+        ),
+        None => decode_b64_url(value)
+            .or_else(|_| decode_b64_std(value))
+            .or_else(|_| decode_hex(value))
+            .context("Failed to decode EAB key (tried base64url, base64, hex)")?,
+    };
+
+    if key.is_empty() {
+        anyhow::bail!("Decoded EAB HMAC key is empty");
+    }
+    Ok(key)
 }
 
 impl AcmeClient {
@@ -82,21 +141,18 @@ impl AcmeClient {
             .collect()
     }
 
-    /// Initialize a new ACME client and register an account with the staging API.
     pub async fn new(
         email: &str,
         config_dir: PathBuf,
         production: bool,
         custom_server: Option<String>,
         root_cert: Option<PathBuf>,
-        eab_kid: Option<String>,
-        eab_hmac_key: Option<String>,
+        external_account_binding: Option<ExternalAccountBindingConfig>,
     ) -> Result<Self> {
         fs::create_dir_all(&config_dir).context("Failed to create config dir")?;
         let creds_path = config_dir.join("account_creds.json");
         let lock_path = config_dir.join("account_creds.json.lock");
         use fs3::FileExt;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -113,9 +169,9 @@ impl AcmeClient {
             let creds_json = fs::read_to_string(&creds_path)?;
             let creds: AccountCredentials = serde_json::from_str(&creds_json)?;
             let builder = match root_cert {
-                Some(path) => instant_acme::Account::builder_with_root(path)
+                Some(path) => Account::builder_with_root(path)
                     .context("Failed to init HTTP client with custom root")?,
-                None => instant_acme::Account::builder().context("Failed to init HTTP client")?,
+                None => Account::builder().context("Failed to init HTTP client")?,
             };
             builder
                 .from_credentials(creds)
@@ -136,18 +192,21 @@ impl AcmeClient {
                 LetsEncrypt::Staging.url().to_string()
             };
             let builder = match root_cert {
-                Some(path) => instant_acme::Account::builder_with_root(path)
+                Some(path) => Account::builder_with_root(path)
                     .context("Failed to init HTTP client with custom root")?,
-                None => instant_acme::Account::builder().context("Failed to init HTTP client")?,
+                None => Account::builder().context("Failed to init HTTP client")?,
             };
-            let eab = match (eab_kid, eab_hmac_key) {
-                (Some(kid), Some(hmac)) => {
-                    let key_bytes = BASE64_URL_SAFE_NO_PAD.decode(hmac.trim_end_matches('='))
-                        .context("Failed to decode EAB HMAC key (expected base64url)")?;
-                    Some(ExternalAccountKey::new(kid, &key_bytes))
-                }
-                _ => None,
-            };
+
+            let eak = external_account_binding.as_ref().map(|cfg| {
+                ExternalAccountKey::new(cfg.kid.clone(), cfg.hmac_key.as_slice())
+            });
+            if let Some(cfg) = external_account_binding.as_ref() {
+                info!(
+                    "🔗 Using External Account Binding (kid={}, hmac_key_len={})",
+                    cfg.kid,
+                    cfg.hmac_key.len()
+                );
+            }
 
             let (account, creds) = builder
                 .create(
@@ -157,7 +216,7 @@ impl AcmeClient {
                         only_return_existing: false,
                     },
                     url,
-                    eab.as_ref(),
+                    eak.as_ref(),
                 )
                 .await
                 .context("Failed to create ACME account")?;
@@ -169,7 +228,6 @@ impl AcmeClient {
             let mut perms = fs::metadata(temp_file.path())?.permissions();
             perms.set_mode(0o600);
             fs::set_permissions(temp_file.path(), perms)?;
-            use std::io::Write;
             temp_file.write_all(creds_json.as_bytes())?;
             temp_file.flush()?;
             temp_file.persist(&creds_path)?;
@@ -218,6 +276,7 @@ impl AcmeClient {
         &self,
         order: &mut Order,
         domain: &str,
+        mut authenticator: Option<&mut dyn crate::interfaces::Authenticator>,
         mut installer: Option<&mut dyn crate::interfaces::Installer>,
         preferred_challenge: &str,
         dns_propagation_seconds: u64,
@@ -310,31 +369,20 @@ impl AcmeClient {
         info!("📜 Requesting certificate issuance (finalizing)...");
         
         let mut names = Vec::new();
-        let mut identifiers = order.identifiers();
-        while let Some(result) = identifiers.next().await {
+        let mut idents = order.identifiers();
+        while let Some(result) = idents.next().await {
             names.push(result.map_err(|e| anyhow::anyhow!("Failed to get identifier: {:?}", e))?.to_string());
         }
 
-        let mut params = CertificateParams::new(names).context("Failed to create certificate params")?;
-        params.distinguished_name = DistinguishedName::new();
-        
-        let key_pair = match key_type {
-            KeyType::Ecdsa => {
-                let curve = match elliptic_curve {
-                    EllipticCurve::P256 => &rcgen::PKCS_ECDSA_P256_SHA256,
-                    EllipticCurve::P384 => &rcgen::PKCS_ECDSA_P384_SHA384,
-                };
-                KeyPair::generate_for_alg(curve).context("Failed to generate ECDSA key")?
-            }
-            KeyType::Rsa => {
-                KeyPair::generate_rsa(rsa_key_size as usize).context("Failed to generate RSA key")?
-            }
-        };
+        let (csr_der, private_key_pem) = generate_csr_der_and_private_key_pem(
+            names,
+            key_type,
+            rsa_key_size,
+            elliptic_curve,
+        )?;
 
-        let csr = params.serialize_request(&key_pair).context("Failed to serialize CSR")?;
-        order.finalize_csr(csr.der()).await.context("Failed to finalize order with custom CSR")?;
+        order.finalize_csr(&csr_der).await.context("Failed to finalize order with custom CSR")?;
 
-        let private_key_pem = key_pair.serialize_pem();
         let cert_chain_pem = order
             .poll_certificate(&RetryPolicy::new())
             .await
@@ -364,6 +412,7 @@ impl AcmeClient {
         temp_key.write_all(private_key_pem.as_bytes())?;
         temp_key.flush()?;
         temp_key.persist(&key_path)?;
+
         let mut temp_crt = tempfile::Builder::new()
             .prefix("crt_tmp_")
             .tempfile_in(&domain_dir)
@@ -374,9 +423,10 @@ impl AcmeClient {
         temp_crt.write_all(cert_chain_pem.as_bytes())?;
         temp_crt.flush()?;
         temp_crt.persist(&crt_path)?;
+
         info!(
             "✅ Certificates successfully saved to {:?}",
-            self.config_dir
+            domain_dir
         );
 
         if let Some(ref mut inst) = installer {
@@ -401,5 +451,37 @@ impl AcmeClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_eab_hmac_key() {
+        // Empty strings should fail
+        assert!(decode_eab_hmac_key("").is_err());
+        assert!(decode_eab_hmac_key("hex:").is_err());
+        
+        // Hex
+        assert_eq!(decode_eab_hmac_key("hex:010203").unwrap(), vec![1, 2, 3]);
+        assert_eq!(decode_eab_hmac_key("hex: 010203 ").unwrap(), vec![1, 2, 3]);
+        
+        // Base64 Standard
+        assert_eq!(decode_eab_hmac_key("base64:AQID").unwrap(), vec![1, 2, 3]);
+        assert_eq!(decode_eab_hmac_key("b64:AQID").unwrap(), vec![1, 2, 3]);
+        
+        // Base64 URL Safe
+        assert_eq!(decode_eab_hmac_key("base64url:AQID").unwrap(), vec![1, 2, 3]);
+        assert_eq!(decode_eab_hmac_key("b64url:AQID").unwrap(), vec![1, 2, 3]);
+        // Let's test actual URL safe characters
+        assert_eq!(decode_eab_hmac_key("base64url:-_8").unwrap(), vec![251, 255]);
+        
+        // Auto-detect fallback
+        assert_eq!(decode_eab_hmac_key("AQID").unwrap(), vec![1, 2, 3]);
+        
+        // Invalid prefix
+        assert!(decode_eab_hmac_key("invalid:AQID").is_err());
     }
 }

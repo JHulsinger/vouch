@@ -115,11 +115,22 @@ Designed to be run repeatedly (e.g., daily) via a systemd timer or cron job.
 vouch renew --days 30 --production
 ```
 
+### 3. Enterprise ACME (EAB)
+Some ACME providers require External Account Binding (EAB) when creating a new account.
+
+```bash
+export VOUCH_EAB_KID="YOUR_KID"
+export VOUCH_EAB_HMAC_KEY="base64url:YOUR_HMAC_KEY"
+vouch certonly --domain example.com --email you@example.com --server https://acme.example.com/directory
+```
+
 ### Global Options
 
 - `--config-dir <path>`: where account/cert material is persisted
 - `--production`: Use Let's Encrypt Production instead of Staging
 - `--server <URL>`: Override the ACME directory entirely (e.g., Pebble)
+- `--eab-kid <KID>` / `VOUCH_EAB_KID`: External Account Binding key identifier
+- `--eab-hmac-key <KEY>` / `VOUCH_EAB_HMAC_KEY`: External Account Binding HMAC key (`hex:`, `base64:`, `base64url:`; otherwise auto-detect)
 - `--installer <path>`: Executable to call after successful deployment (e.g., a script executing `systemctl reload nginx`)
 - `--log-format <text|json>`: Define stdout output format for parsability by automation.
 
@@ -127,6 +138,7 @@ vouch renew --days 30 --production
 
 - **Staging by default:** this avoids burning real rate limits while iterating. A production toggle should be added before real-world use.
 - **Keys on disk:** `domain.key` is sensitive material. Keep the config directory private and backed up appropriately.
+- **EAB HMAC keys:** treat `--eab-hmac-key` / `VOUCH_EAB_HMAC_KEY` as a secret (prefer env vars over shell history).
 - **Concurrency:** locking exists to prevent accidental corruption, but you should still avoid running multiple instances against the same config dir.
 
 ## Vulnerability reporting
@@ -150,4 +162,3 @@ Important: “GitHub Private Vulnerability Reporting” is a **GitHub repository
 
 1. **Plugin Marketplace:** Build the `vouch plugin` command to download IPC plugins securely over HTTP (using the Git index repository model).
 2. **Short-Lived Cert Stability:** Optimize the renewal loop for certificates with 7-day validity (the post-OCSP standard), ensuring zero-downtime hot-reloads.
-3. **Enterprise ACME (EAB):** Support External Account Binding for integration with non-LE providers (DigiCert, Sectigo, etc.) using KID/HMAC keys.

@@ -4,36 +4,12 @@ use directories::ProjectDirs;
 use std::path::PathBuf;
 use tracing::{error, info};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
-use vouch::acme_client::{AcmeClient, KeyType, RsaKeySize, EllipticCurve};
 
-/// Helper to check if a certificate is expiring within a given number of days
-fn check_expiration_days(cert_bytes: &[u8], threshold_days: u32) -> anyhow::Result<(bool, i64)> {
-    let (_, cert) = X509Certificate::from_der(cert_bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {:?}", e))?;
-    
-    let not_after = cert.validity().not_after.timestamp();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    let days_left = (not_after - now) / 86400;
 
-    Ok((days_left <= threshold_days as i64, days_left))
-}
-
-fn run_hook(command: &str, hook_type: &str) {
-    info!("🏃 Running {} hook: {}", hook_type, command);
-    match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .status() {
-        Ok(status) => {
-            if status.success() {
-                info!("✅ {} hook completed successfully", hook_type);
-            } else {
-                error!("❌ {} hook failed with status: {}", hook_type, status);
-            }
-        }
-        Err(e) => error!("❌ Failed to execute {} hook: {}", hook_type, e),
-    }
-}
+use vouch::acme_client::{AcmeClient, ExternalAccountBindingConfig, KeyType, RsaKeySize, EllipticCurve};
+use vouch::plugins::webroot::WebrootAuthenticator;
+use vouch::hooks::{run_hooks, HookContext, HookKind};
+use vouch::renewal::{check_expiration, parse_renew_before_expiry, pick_deterministic_ari_renewal_time, leaf_cert_der_from_pem_or_der};
 
 #[derive(Clone, Debug, ValueEnum)]
 enum LogFormat {
@@ -71,6 +47,14 @@ struct Cli {
     #[arg(long, global = true)]
     root_cert: Option<PathBuf>,
 
+    /// External Account Binding key identifier (KID) for ACME providers that require EAB
+    #[arg(long, global = true, env = "VOUCH_EAB_KID")]
+    eab_kid: Option<String>,
+
+    /// External Account Binding HMAC key (supports `hex:`, `base64:`, `base64url:` prefixes; otherwise auto-detects)
+    #[arg(long, global = true, env = "VOUCH_EAB_HMAC_KEY")]
+    eab_hmac_key: Option<String>,
+
     /// Log format
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -92,37 +76,25 @@ enum Commands {
         /// Webroot path for HTTP-01 challenge fulfillment
         #[arg(short, long)]
         webroot: Option<PathBuf>,
-        /// Output directory for certs
-        #[arg(short, long, default_value = ".")]
-        out_dir: PathBuf,
         /// DNS plugin path (for DNS-01 challenges)
         #[arg(long)]
         dns_plugin: Option<PathBuf>,
-
         /// Wait time (seconds) for DNS propagation
         #[arg(long, default_value_t = 60)]
         dns_propagation_seconds: u64,
-        
         /// Preferred challenge type (http-01 or dns-01)
         #[arg(long, default_value = "http-01")]
         preferred_challenge: String,
 
-        /// External Account Binding Key ID
+        /// Command(s) to run before attempting issuance (repeatable)
         #[arg(long)]
-        eab_kid: Option<String>,
-        /// External Account Binding HMAC Key (base64url encoded)
+        pre_hook: Vec<String>,
+        /// Command(s) to run after attempting issuance (repeatable)
         #[arg(long)]
-        eab_hmac_key: Option<String>,
-
-        /// Command to run before attempting to obtain a certificate
+        post_hook: Vec<String>,
+        /// Command(s) to run after successful issuance (repeatable)
         #[arg(long)]
-        pre_hook: Option<String>,
-        /// Command to run after attempting to obtain a certificate (regardless of success)
-        #[arg(long)]
-        post_hook: Option<String>,
-        /// Command to run after successfully obtaining a certificate
-        #[arg(long)]
-        deploy_hook: Option<String>,
+        deploy_hook: Vec<String>,
 
         /// Key type (rsa or ecdsa)
         #[arg(long, value_enum, default_value_t = KeyType::Ecdsa)]
@@ -137,39 +109,38 @@ enum Commands {
     
     /// Renew all certificates that are approaching expiration
     Renew {
-        /// Number of days before expiration to consider a certificate due for renewal
-        #[arg(long, default_value_t = 30)]
-        days: u32,
+        /// Number of days before expiration (or Certbot-style duration like '30d', '12h') to consider a certificate due for renewal
+        #[arg(long, default_value = "30d")]
+        renew_before_expiry: String,
         
         /// Authenticator plugin path (for IPC)
         #[arg(long)]
         authenticator: Option<PathBuf>,
-        
         /// DNS plugin path (for DNS-01 challenges)
         #[arg(long)]
         dns_plugin: Option<PathBuf>,
-
         /// Wait time (seconds) for DNS propagation
         #[arg(long, default_value_t = 60)]
         dns_propagation_seconds: u64,
-
         /// Installer plugin path (for IPC)
         #[arg(long)]
         installer: Option<PathBuf>,
-        
-        /// Webroot path for HTTP-01 challenges (creates .well-known/acme-challenge/)
+        /// Webroot path for HTTP-01 challenges
         #[arg(long)]
         webroot: Option<PathBuf>,
 
-        /// Command to run before attempting renewal
+        /// Command(s) to run before attempting renewal (repeatable)
         #[arg(long)]
-        pre_hook: Option<String>,
-        /// Command to run after attempting renewal (regardless of success)
+        pre_hook: Vec<String>,
+        /// Command(s) to run after attempting renewal (repeatable)
         #[arg(long)]
-        post_hook: Option<String>,
-        /// Command to run after successfully renewing a certificate
+        post_hook: Vec<String>,
+        /// Command(s) to run after each successful renewal (repeatable)
         #[arg(long)]
-        deploy_hook: Option<String>,
+        deploy_hook: Vec<String>,
+        /// Alias for deploy_hook (Certbot compatibility)
+        #[arg(long)]
+        renew_hook: Option<String>,
 
         /// Key type (rsa or ecdsa)
         #[arg(long, value_enum, default_value_t = KeyType::Ecdsa)]
@@ -181,6 +152,9 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = EllipticCurve::P256)]
         elliptic_curve: EllipticCurve,
     },
+
+    /// List managed certificates and their statuses
+    Certificates,
 }
 
 #[tokio::main]
@@ -223,23 +197,26 @@ async fn main() {
     }
 
     if let Err(e) = run(cli, config_dir, work_dir).await {
-        error!("Error: {:#}", e);
+        error!("Fatal Error: {:#}", e);
         std::process::exit(1);
     }
 }
 
 async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
+    let eab_config = match (cli.eab_kid.clone(), cli.eab_hmac_key.clone()) {
+        (None, None) => None,
+        (Some(kid), Some(key)) => Some(ExternalAccountBindingConfig::new(kid, &key)?),
+        _ => anyhow::bail!("Both --eab-kid and --eab-hmac-key are required if either is provided"),
+    };
+
     match &cli.command {
         Commands::Certonly {
             domain,
             email,
             webroot,
-            out_dir: _out_dir,
-            dns_plugin: _dns_plugin,
+            dns_plugin,
             dns_propagation_seconds,
             preferred_challenge,
-            eab_kid,
-            eab_hmac_key,
             pre_hook,
             post_hook,
             deploy_hook,
@@ -247,71 +224,59 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
             rsa_key_size,
             elliptic_curve,
         } => {
-            if let Some(hook) = pre_hook {
-                run_hook(hook, "pre");
-            }
+            let hook_ctx = HookContext::new().with_var("VOUCH_DOMAIN", domain);
+            run_hooks(HookKind::Pre, pre_hook, &hook_ctx)?;
 
             let result = async {
-                if domain.starts_with("*.") {
-                    if _dns_plugin.is_none() || preferred_challenge != "dns-01" {
-                        anyhow::bail!("Wildcard domains (*.example.com) require DNS-01 challenge. Please provide a --dns-plugin.");
-                    }
+                if domain.starts_with("*.") && preferred_challenge != "dns-01" {
+                    anyhow::bail!("Wildcard domains require DNS-01 challenge. Use --preferred-challenge dns-01");
                 }
-                
-                info!("🚀 Starting vouch for domain: {}", domain);
-                
-                let env_name = if cli.server.is_some() { "CUSTOM" } else if cli.production { "PRODUCTION" } else { "STAGING" };
-                info!("📦 Registering account with Let's Encrypt ({env_name})...");
+
+                info!("🚀 Requesting certificate for: {}", domain);
                 let client = AcmeClient::new(
-                    email, 
-                    config_dir, 
-                    cli.production, 
-                    cli.server, 
-                    cli.root_cert,
-                    eab_kid.clone(),
-                    eab_hmac_key.clone()
+                    email,
+                    config_dir.clone(),
+                    cli.production,
+                    cli.server.clone(),
+                    cli.root_cert.clone(),
+                    eab_config.clone(),
                 ).await?;
-                info!("✅ Account created/loaded!");
-                
-                info!("📝 Creating order for {}...", domain);
+
                 let mut order = client.new_order(domain).await?;
-                info!("✅ Order pending. State: {:?}", order.state().status);
-                
+
                 let mut webroot_auth = webroot.as_ref().map(|path| WebrootAuthenticator::new(path.clone()));
-                let authenticator_ref = webroot_auth.as_mut().map(|w| w as &mut dyn vouch::interfaces::Authenticator);
+                let mut dns_auth = dns_plugin.as_ref().map(|p| vouch::interfaces::IpcPlugin::new(p.to_str().expect("invalid dns plugin path")));
+
+                let auth_ref: Option<&mut dyn vouch::interfaces::Authenticator> = if let Some(ref mut w) = webroot_auth {
+                    Some(w)
+                } else if let Some(ref mut d) = dns_auth {
+                    Some(d)
+                } else {
+                    None
+                };
 
                 client.verify_and_finalize(
-                    &mut order, 
-                    domain, 
-                    authenticator_ref, 
-                    None, 
-                    preferred_challenge, 
+                    &mut order,
+                    domain,
+                    auth_ref,
+                    None,
+                    preferred_challenge,
                     *dns_propagation_seconds,
                     key_type.clone(),
                     *rsa_key_size,
-                    elliptic_curve.clone()
+                    elliptic_curve.clone(),
                 ).await?;
-                
-                if let Some(hook) = deploy_hook {
-                    run_hook(hook, "deploy");
-                }
-                
+
+                run_hooks(HookKind::Deploy, deploy_hook, &hook_ctx)?;
                 Ok(())
             }.await;
 
-            if let Some(hook) = post_hook {
-                run_hook(hook, "post");
-            }
+            run_hooks(HookKind::Post, post_hook, &hook_ctx)?;
+            result
+        }
 
-            if let Err(e) = result {
-                error!("❌ Certonly failed: {:?}", e);
-                std::process::exit(2);
-            }
-            
-            info!("🏁 vouch run complete");
-        },
         Commands::Renew {
-            days,
+            renew_before_expiry,
             authenticator,
             dns_plugin,
             dns_propagation_seconds,
@@ -320,17 +285,23 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
             pre_hook,
             post_hook,
             deploy_hook,
+            renew_hook,
             key_type,
             rsa_key_size,
             elliptic_curve,
         } => {
-            if let Some(hook) = pre_hook {
-                run_hook(hook, "pre");
+            let threshold = parse_renew_before_expiry(renew_before_expiry)?;
+            let mut deploy_hooks = deploy_hook.clone();
+            if let Some(rh) = renew_hook {
+                deploy_hooks.push(rh.clone());
             }
 
-            info!("🔄 Starting renewal check...");
-            let mut renewed_count = 0;
-            let mut checked_count = 0;
+            info!("🔄 Starting renewal scan (threshold: {:#?})...", threshold);
+            
+            run_hooks(HookKind::Pre, pre_hook, &HookContext::new())?;
+
+            let mut checked = 0;
+            let mut renewed = 0;
 
             if config_dir.exists() {
                 for entry in std::fs::read_dir(&config_dir)? {
@@ -338,125 +309,121 @@ async fn run(cli: Cli, config_dir: PathBuf, _work_dir: PathBuf) -> Result<()> {
                     let path = entry.path();
                     if path.is_dir() {
                         let cert_path = path.join("domain.crt");
-                        if cert_path.exists() {
+                        let key_path = path.join("domain.key");
+                        if cert_path.exists() && key_path.exists() {
                             let domain_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                            checked_count += 1;
+                            checked += 1;
                             
                             let cert_bytes = std::fs::read(&cert_path)?;
-                            match check_expiration_days(&cert_bytes, *days) {
-                                Ok((needs_renewal, days_left)) => {
-                                    if needs_renewal {
-                                        info!("⚠️ Certificate for {} expires in {} days (threshold: {}). Triggering renewal...", domain_name, days_left, days);
+                            let (mut should_renew, days_left) = check_expiration(&cert_bytes, threshold)?;
+                            
+                            let mut replaces = None;
+                            if let Ok(der) = leaf_cert_der_from_pem_or_der(&cert_bytes) {
+                                let der = rustls_pki_types::CertificateDer::from(der);
+                                if let Ok(cert_id) = instant_acme::CertificateIdentifier::try_from(&der) {
+                                    let cert_id = cert_id.into_owned();
+                                    replaces = Some(cert_id.clone());
                                     
-                                    let env_name = if cli.server.is_some() { "CUSTOM" } else if cli.production { "PRODUCTION" } else { "STAGING" };
-                                    info!("📦 Registering account with Let's Encrypt ({env_name})...");
-                                    
-                                    // Instantiate the client with an empty email (uses existing account)
-                                    let client = AcmeClient::new("", config_dir.clone(), cli.production, cli.server.clone(), cli.root_cert.clone(), None, None).await?;
-                                    info!("📝 Creating order for {}...", domain_name);
-                                    let mut order = client.new_order(&domain_name).await?;
-
-                                    // Resolve Plugins using concrete types to avoid lifetime issues with Box<dyn>
-                                    let mut webroot_auth = webroot.as_ref().map(|w| vouch::plugins::webroot::WebrootAuthenticator::new(w.clone()));
-                                    let mut ipc_auth = if let Some(p) = authenticator {
-                                        let p_str: &std::path::Path = p;
-                                        Some(vouch::interfaces::IpcPlugin::new(p_str.to_str().expect("invalid authenticator path")))
-                                    } else if let Some(p) = dns_plugin {
-                                        let p_str: &std::path::Path = p;
-                                        Some(vouch::interfaces::IpcPlugin::new(p_str.to_str().expect("invalid dns plugin path")))
-                                    } else {
-                                        None
-                                    };
-                                    let mut ipc_inst = installer.as_ref().map(|p| {
-                                        let p_str: &std::path::Path = p;
-                                        vouch::interfaces::IpcPlugin::new(p_str.to_str().expect("invalid installer path"))
-                                    });
-
-                                    let mut auth_ref: Option<&mut dyn vouch::interfaces::Authenticator> = None;
-                                    let preferred_challenge_str = if dns_plugin.is_some() { "dns-01" } else { "http-01" };
-
-                                    if let Some(ref mut w) = webroot_auth {
-                                        auth_ref = Some(w);
-                                    } else if let Some(ref mut i) = ipc_auth {
-                                        auth_ref = Some(i);
-                                    }
-
-                                    let inst_ref: Option<&mut dyn vouch::interfaces::Installer> = ipc_inst.as_mut().map(|i| i as &mut dyn vouch::interfaces::Installer);
-                                    
-                                    if let Err(e) = client.verify_and_finalize(
-                                        &mut order, 
-                                        &domain_name, 
-                                        auth_ref, 
-                                        inst_ref, 
-                                        preferred_challenge_str, 
-                                        *dns_propagation_seconds,
-                                        key_type.clone(),
-                                        *rsa_key_size,
-                                        elliptic_curve.clone()
-                                    ).await {
-                                        error!("❌ Failed to renew certificate for {}: {:?}", domain_name, e);
-                                    } else {
-                                        info!("✅ Successfully renewed certificate for {}", domain_name);
-                                        renewed_count += 1;
-                                        if let Some(hook) = deploy_hook {
-                                            run_hook(hook, "deploy");
+                                    // ARI Check (Optional/Best Effort)
+                                    let account_client = AcmeClient::new("", config_dir.clone(), cli.production, cli.server.clone(), cli.root_cert.clone(), eab_config.clone()).await?;
+                                    match account_client.account.renewal_info(&cert_id).await {
+                                        Ok((info, _)) => {
+                                            let now = time::OffsetDateTime::now_utc();
+                                            let selected = pick_deterministic_ari_renewal_time(&info.suggested_window, &domain_name);
+                                            if now >= selected {
+                                                info!("📅 ARI suggests renewal for {} (now={}, selected={})", domain_name, now, selected);
+                                                should_renew = true;
+                                            }
                                         }
+                                        Err(_) => {} // Fall back to threshold check
                                     }
-                                    } else {
-                                        info!("⏭️ Certificate for {} is valid for {} more days. Skipping.", domain_name, days_left);
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("❌ Failed to parse certificate at {:?}: {}", cert_path, e);
                                 }
+                            }
+
+                            if should_renew {
+                                info!("⚠️ Renewing {} (exps in {} days)...", domain_name, days_left);
+                                let client = AcmeClient::new("", config_dir.clone(), cli.production, cli.server.clone(), cli.root_cert.clone(), eab_config.clone()).await?;
+                                
+                                let mut order = if let Some(rep) = replaces {
+                                    client.account.new_order(&instant_acme::NewOrder::new(&[instant_acme::Identifier::Dns(domain_name.clone())]).replaces(rep)).await?
+                                } else {
+                                    client.new_order(&domain_name).await?
+                                };
+
+                                let mut webroot_auth = webroot.as_ref().map(|w| WebrootAuthenticator::new(w.clone()));
+                                let mut dns_auth = dns_plugin.as_ref().map(|p| vouch::interfaces::IpcPlugin::new(p.to_str().expect("invalid dns plugin path")));
+                                let mut ipc_auth = authenticator.as_ref().map(|p| vouch::interfaces::IpcPlugin::new(p.to_str().expect("invalid authenticator path")));
+                                
+                                let auth_ref: Option<&mut dyn vouch::interfaces::Authenticator> = if let Some(ref mut w) = webroot_auth {
+                                    Some(w)
+                                } else if let Some(ref mut d) = dns_auth {
+                                    Some(d)
+                                } else if let Some(ref mut i) = ipc_auth {
+                                    Some(i)
+                                } else {
+                                    None
+                                };
+
+                                let mut installer_plugin = installer.as_ref().map(|p| vouch::interfaces::IpcPlugin::new(p.to_str().expect("invalid installer path")));
+                                let inst_ref: Option<&mut dyn vouch::interfaces::Installer> = installer_plugin.as_mut().map(|i| i as &mut dyn vouch::interfaces::Installer);
+
+                                let pref_chal = if dns_plugin.is_some() { "dns-01" } else { "http-01" };
+                                
+                                if let Err(e) = client.verify_and_finalize(
+                                    &mut order,
+                                    &domain_name,
+                                    auth_ref,
+                                    inst_ref,
+                                    pref_chal,
+                                    *dns_propagation_seconds,
+                                    key_type.clone(),
+                                    *rsa_key_size,
+                                    elliptic_curve.clone()
+                                ).await {
+                                    error!("❌ Failed to renew {}: {}", domain_name, e);
+                                } else {
+                                    renewed += 1;
+                                    let hctx = HookContext::new()
+                                        .with_var("VOUCH_DOMAIN", &domain_name)
+                                        .with_var("VOUCH_CERT_PATH", cert_path.to_str().unwrap_or(""))
+                                        .with_var("VOUCH_KEY_PATH", key_path.to_str().unwrap_or(""))
+                                        // Certbot compatibility
+                                        .with_var("RENEWED_DOMAINS", &domain_name)
+                                        .with_var("RENEWED_LINEAGE", path.to_str().unwrap_or(""))
+                                        .with_var("RENEWED_CERT", cert_path.to_str().unwrap_or(""))
+                                        .with_var("RENEWED_PRIVKEY", key_path.to_str().unwrap_or(""));
+                                    run_hooks(HookKind::Deploy, &deploy_hooks, &hctx)?;
+                                }
+                            } else {
+                                info!("⏭️ Skipping {} ({} days remaining)", domain_name, days_left);
                             }
                         }
                     }
                 }
             }
-            
-            if let Some(hook) = post_hook {
-                run_hook(hook, "post");
-            }
-            
-            info!("🏁 Renewal check complete. Checked: {}, Renewed: {}", checked_count, renewed_count);
-            let exit_code = 0; 
-            std::process::exit(exit_code);
+
+            run_hooks(HookKind::Post, post_hook, &HookContext::new())?;
+            info!("🏁 Renewal check complete. Checked: {}, Renewed: {}", checked, renewed);
+            Ok(())
         }
-    }
-    Ok(())
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ::rcgen::{CertificateParams, KeyPair};
-    use ::time::{OffsetDateTime, Duration};
-
-    #[test]
-    fn test_check_expiration_days() {
-        let now = OffsetDateTime::now_utc();
-        
-        // 1. Certificate expiring tomorrow (needs renewal under 30 days)
-        let mut params1 = CertificateParams::new(vec!["test.example.com".to_string()]);
-        params1.not_before = now - Duration::days(1);
-        params1.not_after = now + Duration::days(1);
-        let cert_tomorrow = rcgen::Certificate::from_params(params1).unwrap();
-        let der_tomorrow = cert_tomorrow.serialize_der().unwrap();
-        
-        let (needs_renewal, days_left) = check_expiration_days(&der_tomorrow, 30).unwrap();
-        assert!(needs_renewal, "Cert expiring tomorrow should need renewal under 30 day threshold");
-        assert_eq!(days_left, 1);
-
-        // 2. Certificate expiring in 60 days (does NOT need renewal under 30 days)
-        let mut params2 = CertificateParams::new(vec!["test.example.com".to_string()]);
-        params2.not_after = now + Duration::days(60);
-        let cert_future = rcgen::Certificate::from_params(params2).unwrap();
-        let der_future = cert_future.serialize_der().unwrap();
-        
-        let (needs_renewal, days_left) = check_expiration_days(&der_future, 30).unwrap();
-        assert!(!needs_renewal, "Cert expiring in 60 days should NOT need renewal under 30 day threshold (got {})", days_left);
-        // It could be 59 or 60 depending on the exact second
-        assert!(days_left == 60 || days_left == 59); 
+        Commands::Certificates => {
+            if config_dir.exists() {
+                for entry in std::fs::read_dir(&config_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let cert_path = path.join("domain.crt");
+                        if cert_path.exists() {
+                            let domain = path.file_name().unwrap_or_default().to_string_lossy();
+                            let cert_bytes = std::fs::read(&cert_path)?;
+                            let (_, days_left) = check_expiration(&cert_bytes, std::time::Duration::from_secs(0))?;
+                            println!("- {} ({} days remaining) at {:?}", domain, days_left, path);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }
