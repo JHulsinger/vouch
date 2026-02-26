@@ -12,12 +12,12 @@ This exists because, in real deployments, Certbot’s biggest pain points are ra
 
 ## Status (what works today)
 
-- **Project stage:** beta / early scaffold
-- **ACME directory:** Let’s Encrypt **Staging** (safe while iterating)
-- **Main command:** `certonly` (obtain/renew flow)
+- **Project stage:** beta / production-ready candidate
+- **ACME directory:** Let’s Encrypt Staging by default, Production via `--production`
+- **Commands:** `certonly` (obtain flow) and `renew` (automated background checking)
+- **Challenges:** HTTP-01 (via built-in Webroot) and DNS-01 (via external IPC plugins)
+- **Installers:** Full hook support for external binaries (e.g., reloading Nginx)
 - **Persistence:** ACME account credentials are stored on disk so identities survive restarts (rate-limit safety)
-
-It is **not** a drop-in replacement for Certbot yet. The CLI surface, challenge fulfillment, and installer integrations are still incomplete.
 
 ## What vouch does (current behavior)
 
@@ -25,12 +25,18 @@ At a high level, `vouch certonly`:
 
 1. Resolves a config directory (OS-default or `--config-dir`).
 2. Acquires an exclusive lock to prevent concurrent state corruption.
-3. Loads existing ACME account credentials, or creates a new account (staging).
+3. Loads existing ACME account credentials, or creates a new account.
 4. Creates an order for the requested domain.
-5. Iterates authorizations and marks the HTTP-01 challenge “ready” (currently a stub integration point for real challenge fulfillment).
+5. Invokes the correct Authenticator (e.g., writing to `--webroot` or calling a `--dns-plugin`) to satisfy the challenge.
 6. Polls the order until it becomes `Ready`.
 7. Finalizes the order and fetches the certificate chain.
-8. Writes key/cert to disk atomically with strict permissions.
+8. Writes key/cert to disk atomically with strict permissions (`0600`).
+9. Invokes the optional `--installer` plugin to reload services or copy certificates.
+
+For `vouch renew`:
+1. Scans the `--config-dir` for existing directories (domains).
+2. Parses the `domain.crt` using `x509-parser` to calculate expiration.
+3. Only triggers a full ACME run if the cert expires in <= 30 days (non-interactive, cron-safe).
 
 ## Files written to disk
 
@@ -48,21 +54,23 @@ Notes:
 - Writes use temp files + atomic persist to avoid partial writes on crash.
 - Locking is used to avoid two runs racing and corrupting credentials/state.
 
-## Plugin model (direction)
+## Plugin model 
 
-Certbot’s core power is its plugin ecosystem. `vouch` mirrors that structure so we can reach parity without hardcoding every integration into the core:
+Certbot’s core power is its plugin ecosystem. `vouch` mirrors that structure but completely escapes the "Python monolith" problem. 
 
 - `Authenticator`: responsible for satisfying challenges (HTTP-01/DNS-01).
 - `Installer`: responsible for deploying certs / modifying server config.
 - `Plugin`: a combined trait when a plugin does both.
 
-To avoid brittle Rust ABI guarantees for out-of-tree plugins, `vouch` includes an IPC-based plugin wrapper:
+### IPC Plugins (The Marketplace Advantage)
+To avoid brittle Rust ABI guarantees and slow monolith compiles, `vouch` uses an **IPC-based plugin wrapper**:
 
-- `IpcPlugin` spawns an external helper (e.g., a future `vouch-nginx`).
-- Calls are proxied as JSON-RPC messages over stdin/stdout.
-- Response size is bounded to reduce memory abuse risk.
+- You can write a plugin in **any language** (Bash, Go, Node.js, Python).
+- `vouch` spawns the plugin as an external binary.
+- Calls are proxied as **JSON-RPC** messages over `stdin`/`stdout`.
+- The plugin just reads JSON, fulfills the challenge (e.g., updates a Route53 DNS record), and writes a JSON success response.
 
-Today, the ACME flow prints a stub message where an authenticator would actually deploy a challenge response.
+This language-agnostic boundary allows us to build a marketplace of isolated, secure executables rather than giant pip packages.
 
 ## Install / build
 
@@ -90,17 +98,30 @@ cargo check
 
 ## Usage
 
-Run from source:
-
+### 1. Issue a new certificate
+**Using HTTP-01 (Webroot):**
 ```bash
-cargo run -- certonly --domain example.com --email you@example.com
+vouch certonly --domain example.com --email you@example.com --webroot /var/www/html --production
 ```
 
-Global path overrides:
+**Using DNS-01 (External Plugin):**
+```bash
+vouch certonly --domain example.com --email you@example.com --dns-plugin /usr/local/bin/vouch-dns-cloudflare --production
+```
+
+### 2. Renew existing certificates
+Designed to be run repeatedly (e.g., daily) via a systemd timer or cron job.
+```bash
+vouch renew --days 30 --production
+```
+
+### Global Options
 
 - `--config-dir <path>`: where account/cert material is persisted
-- `--work-dir <path>`: intended working state dir (parsed; not fully wired yet)
-- `--logs-dir <path>`: intended log dir (parsed; not fully wired yet)
+- `--production`: Use Let's Encrypt Production instead of Staging
+- `--server <URL>`: Override the ACME directory entirely (e.g., Pebble)
+- `--installer <path>`: Executable to call after successful deployment (e.g., a script executing `systemctl reload nginx`)
+- `--log-format <text|json>`: Define stdout output format for parsability by automation.
 
 ## Security notes (read this before pointing at production)
 
@@ -123,15 +144,10 @@ Important: “GitHub Private Vulnerability Reporting” is a **GitHub repository
 
 ## Known limitations (beta)
 
-- Challenge fulfillment is currently a stub integration point (no real HTTP-01/DNS-01 deployment yet).
-- Installer integrations (nginx/apache/webroot equivalents) are not implemented yet.
 - `--work-dir` and `--logs-dir` are parsed but not fully wired into runtime behavior.
-- ACME directory selection is not yet configurable (staging only).
 
 ## Roadmap (practical next steps)
 
-1. Add real authenticator plugins for HTTP-01 and/or DNS-01.
-2. Add installer plugins for certificate deployment and reload.
-3. Add explicit staging/production ACME selection via CLI/config.
-4. Add structured logs + stable exit codes for automation.
-5. Add integration tests around account persistence and finalize flow.
+1. **Plugin Marketplace:** Build the `vouch plugin` command to download IPC plugins securely over HTTP (using the Git index repository model).
+2. **Wildcard Support:** Expose native wildcard CLI validation mapping internally to DNS-01 only.
+3. **Automated Reversion:** Store `.old` copies of certificates before renewal to rollback if an installer fails validation.
