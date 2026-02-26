@@ -149,5 +149,5 @@ Important: “GitHub Private Vulnerability Reporting” is a **GitHub repository
 ## Roadmap (practical next steps)
 
 1. **Plugin Marketplace:** Build the `vouch plugin` command to download IPC plugins securely over HTTP (using the Git index repository model).
-2. **OCSP Must-Staple:** Add support for the Must-Staple extension in certificate requests.
-3. **External PKI:** Support for ACME-EAB (External Account Binding) for integration with enterprise CAs.
+2. **Short-Lived Cert Stability:** Optimize the renewal loop for certificates with 7-day validity (the post-OCSP standard), ensuring zero-downtime hot-reloads.
+3. **Enterprise ACME (EAB):** Support External Account Binding for integration with non-LE providers (DigiCert, Sectigo, etc.) using KID/HMAC keys.
